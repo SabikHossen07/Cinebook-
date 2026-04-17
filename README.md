@@ -185,17 +185,17 @@ high-priority overrides
 soil moisture blocks
 time-of-day restrictions
 
-📚 Academic Context
+## 📚 Academic Context
 Project Name: Garden Watering Dilemma
 Course Title: Operating System
 Course Code: CSE 325
 
-👨‍💻 Contributors
+## 👨‍💻 Contributors
 Sabik Ahmed Niloy
 Ahmed Khan
 Ajmain Nur Shihab
 
-✅ Conclusion
+## ✅ Conclusion
 This project successfully demonstrates a realistic automated irrigation simulation using multithreading and synchronization techniques. It shows how operating system concepts can be applied in smart automation systems involving:
 
 resource sharing
