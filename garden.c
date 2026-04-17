@@ -1,0 +1,452 @@
+#include <time.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include <semaphore.h>
+ 
+struct item {
+  char name[100];
+  int cnt;
+  int need;
+  int p;
+  int last_time_h;
+  int last_time_m;
+  bool soil_check;
+  pthread_t thread;
+  sem_t semaphore;
+  pthread_mutex_t mutex;
+};
+ 
+pthread_mutex_t water_supply_mutex;
+pthread_mutex_t schedule_mutex;
+pthread_mutex_t water_limit_mutex;
+volatile bool sys_running = true;
+ 
+int n;
+int mx;
+int cur_h = 6;
+int cur_m = 0;
+int water_limit;
+int water_use = 0;
+struct item *g_tm;
+int total_required = 0;
+
+void initialization();
+void strlower(char* s);
+void status(struct item* tm);
+void* item_thread(void* arg);
+void* time_thread(void* arg);
+int last_time(struct item* tm);
+bool check_soil(struct item* tm);
+void water_supply(struct item* tm);
+
+void strlower(char *s) {
+  for (int i = 0; s[i] != '\0'; i++) {
+    s[i] = tolower(s[i]);
+  }
+}
+ 
+void* item_thread(void* arg) {
+  struct item* tm = (struct item*)arg;
+  while (sys_running) {
+    sem_wait(&tm->semaphore);
+    if (tm->cnt >= tm->need) {
+      continue;
+    }
+ 
+    int minutes_since = -1;
+    if (tm->last_time_h >= 0) {
+      int current_minutes = cur_h * 60 + cur_m;
+      int last_minutes = tm->last_time_h * 60 + tm->last_time_m;
+      minutes_since = current_minutes - last_minutes;
+    }
+ 
+    if (minutes_since >= 0 && minutes_since < 60) {
+      continue;
+    }
+ 
+    if (cur_h < 20) {
+      if (check_soil(tm)) {
+        continue;
+      }
+    }
+ 
+    if (cur_h >= 22) {
+      continue;
+    }
+ 
+    pthread_mutex_lock(&water_limit_mutex);
+    int remain = water_limit - water_use;
+    int water_left = remain;
+    pthread_mutex_unlock(&water_limit_mutex);
+    int this_section_needs = tm->need - tm->cnt;
+ 
+    if (water_left < this_section_needs) {
+      if (tm->p > 0) {
+        int high_priority_still_needing = 0;
+        for (int i = 0; i < n; i++) {
+          if (g_tm[i].p == 0 && g_tm[i].cnt < g_tm[i].need) {
+            high_priority_still_needing++;
+          }
+        }
+ 
+        if (high_priority_still_needing > 0 && water_left <= high_priority_still_needing) {
+          continue;
+        }
+      }
+    }
+ 
+    pthread_mutex_lock(&water_supply_mutex);
+    pthread_mutex_lock(&water_limit_mutex);
+    pthread_mutex_lock(&schedule_mutex);
+ 
+    if (water_use >= water_limit || tm->cnt >= tm->need) {
+      pthread_mutex_unlock(&schedule_mutex);
+      pthread_mutex_unlock(&water_limit_mutex);
+      pthread_mutex_unlock(&water_supply_mutex);
+      continue;
+    }
+ 
+    int remaining_for_this = tm->need - tm->cnt;
+    water_use++;
+    tm->cnt++;
+    tm->last_time_h = cur_h;
+    tm->last_time_m = cur_m;
+ 
+    remain = water_limit - water_use;
+    printf("[%02d:%02d] %s: Watered (%d/%d). Water: %d/%d left\n",cur_h, cur_m, tm->name, tm->cnt, tm->need, water_use, water_limit);
+    if (tm->cnt >= tm->need) {
+      pthread_mutex_lock(&tm->mutex);
+      tm->soil_check = rand() % 2;
+      pthread_mutex_unlock(&tm->mutex);
+      printf("[%02d:%02d] %s: REQUIREMENTS MET!\n", cur_h, cur_m, tm->name);
+    }
+ 
+    pthread_mutex_unlock(&schedule_mutex);
+    pthread_mutex_unlock(&water_limit_mutex);
+    water_supply(tm);
+    pthread_mutex_unlock(&water_supply_mutex);
+  }
+ 
+  return NULL;
+}
+ 
+void water_supply(struct item* tm) {
+  usleep(10000);
+  pthread_mutex_lock(&tm->mutex);
+  tm->soil_check = rand() % 2;
+  pthread_mutex_unlock(&tm->mutex);
+}
+ 
+bool check_soil(struct item* tm) {
+  bool r;
+  pthread_mutex_lock(&tm->mutex);
+  r = tm->soil_check;
+  pthread_mutex_unlock(&tm->mutex);
+  return r;
+}
+ 
+int last_time(struct item* tm) {
+  if (tm->last_time_h < 0) return -1;
+  int c_m = cur_h * 60 + cur_m;
+  int l_m = tm->last_time_h * 60 + tm->last_time_m;
+  return (c_m - l_m) / 60;
+}
+ 
+void* time_thread(void* arg) {
+  struct item* tm = (struct item*)arg;
+  int t_m = 0;
+  int mx_m = 16 * 60;
+ 
+  printf("Time thread: Simulating 6 AM to 10 PM (%d minutes)\n", mx_m);
+ 
+  while (t_m < mx_m && sys_running) {
+    pthread_mutex_lock(&schedule_mutex);
+    cur_h = 6 + (t_m / 60);
+    cur_m = t_m % 60;
+    pthread_mutex_unlock(&schedule_mutex);
+    if (t_m % 60 == 0) {
+      for (int i = 0; i < n; i++) {
+        int dry_chance = 0;
+        if (check_soil(tm)) {
+        	dry_chance = 60;
+        }
+
+        if (rand() % 100 < dry_chance) {
+          if (tm[i].cnt < tm[i].need) {
+            pthread_mutex_lock(&tm[i].mutex);
+            tm[i].soil_check = false;
+            pthread_mutex_unlock(&tm[i].mutex);
+          }
+        }
+      }
+    }
+ 
+    if (t_m % 30 == 0) {
+      for (int i = 0; i < n; i++) {
+        if (tm[i].cnt < tm[i].need) {
+          sem_post(&tm[i].semaphore);
+        }
+      }
+    }
+ 
+    if (cur_h >= 18 && t_m % 15 == 0) {
+      for (int i = 0; i < n; i++) {
+        if (tm[i].cnt < tm[i].need) {
+          sem_post(&tm[i].semaphore);
+        }
+      }
+    }
+ 
+    if (cur_h >= 20 && t_m % 5 == 0) {
+      for (int i = 0; i < n; i++) {
+        if (tm[i].cnt < tm[i].need) {
+          sem_post(&tm[i].semaphore);
+        }
+      }
+    }
+ 
+    if (t_m % 60 == 0) {
+      pthread_mutex_lock(&water_limit_mutex);
+      int remain = water_limit - water_use;
+      pthread_mutex_unlock(&water_limit_mutex);
+ 
+      int unmet_needs = 0;
+      for (int i = 0; i < n; i++) {
+        unmet_needs += (tm[i].need - tm[i].cnt);
+      }
+ 
+      printf("\n[%02d:00] Water: %d/%d used, %d left. Still need: %d waterings\n", cur_h, water_use, water_limit, remain, unmet_needs);      
+      if (unmet_needs > remain && cur_h >= 16) {
+        printf("[%02d:00] EMERGENCY: Behind schedule! Increasing watering attempts.\n", cur_h);
+      }
+    }
+    usleep(20000);
+    t_m += 4;
+ 
+    if (t_m > mx_m) {
+      t_m = mx_m;
+    }
+  }
+ 
+  printf("\n[22:00] End of watering day.\n");
+  sys_running = false;
+ 
+  for (int i = 0; i < n; i++) {
+    sem_post(&tm[i].semaphore);
+  }
+ 
+  return NULL;
+}
+ 
+void status(struct item* tm) {
+  printf("\n=========================================\n");
+  printf("FINAL WATERING REPORT\n");
+  printf("=========================================\n");
+ 
+  printf("%-15s %-10s %-10s %-10s %s\n", "Section", "Required", "Done", "Priority", "Status");
+  printf("-------------------------------------------------------------\n");
+ 
+  int t_r = 0;
+  int t_d = 0;
+ 
+  for (int i = 0; i < n; i++) {
+    t_r += tm[i].need;
+    t_d += tm[i].cnt;
+ 
+    char* status;
+    if (tm[i].cnt >= tm[i].need) {
+      status = "COMPLETE";
+    } else if (tm[i].cnt > 0) {
+      status = "PARTIAL";
+    } else {
+      status = "FAILED";
+    }
+ 
+    char* priority;
+    switch(tm[i].p) {
+      case 0: priority = "HIGH"; break;
+      case 1: priority = "MEDIUM"; break;
+      case 2: priority = "LOW"; break;
+      default: priority = "UNKNOWN";
+    }
+ 
+    printf("%-15s %-10d %-10d %-10s %s\n", tm[i].name, tm[i].need, tm[i].cnt, priority, status);
+  }
+ 
+  printf("-------------------------------------------------------------\n");
+  printf("TOTAL:          %-10d %-10d\n", t_r, t_d);
+  printf("Water used:     %d/%d sessions\n", water_use, water_limit);
+ 
+  if (t_r > 0) {
+    double eff = (double)t_d / t_r * 100.0;
+    printf("Efficiency:     %.1lf%%\n", eff);
+ 
+    if (eff == 100.0) {
+      printf("\nSUCCESS: ALL requirements perfectly met!\n");
+    } else if (eff >= 90.0) {
+      printf("\nWARNING: Close but not perfect\n");
+    } else {
+      printf("\nFAILURE: Significant unmet requirements\n");
+    }
+  }
+ 
+  printf("\nANALYSIS:\n");
+  if (water_use < water_limit) {
+    printf("- Had %d unused watering sessions\n", water_limit - water_use);
+  } else {
+    printf("- Used all available water\n");
+  }
+ 
+  if (t_d < t_r) {
+    printf("- Failed to meet %d watering requirements due to:\n", t_r - t_d);
+    printf("  1. Time constraints\n");
+    printf("  2. Moisture sensor blocks\n");
+    printf("  3. Priority system\n");
+    printf("  4. 1-hour gap requirement\n");
+  }
+}
+ 
+void initialization() {
+  srand(time(NULL));
+  pthread_mutex_init(&water_supply_mutex, NULL);
+  pthread_mutex_init(&schedule_mutex, NULL);
+  pthread_mutex_init(&water_limit_mutex, NULL);
+ 
+  printf("Enter number of garden sections: ");
+  scanf("%d", &n);
+ 
+  g_tm = (struct item*)malloc(n * sizeof(struct item));
+  if (!g_tm) {
+    printf("Memory allocation failed!\n");
+    return;
+  }
+ 
+  total_required = 0;
+  mx = 0;
+ 
+  for (int i = 0; i < n; i++) {
+    printf("\nSection %d:\n", i+1);
+    printf("  Name: ");
+    scanf("%s", g_tm[i].name);
+    strlower(g_tm[i].name);
+ 
+    if (strcmp(g_tm[i].name, "greenhouse") == 0) {
+      int humidity = rand() % 100;
+      printf("  Humidity: %d%% - ", humidity);
+      if (humidity > rand() % 100) {
+        g_tm[i].need = 1;
+        printf("Greenhouse needs 1 watering\n");
+      } else {
+        g_tm[i].need = 2;
+        printf("Greenhouse needs 2 waterings\n");
+      }
+    } else {
+    	printf("  Daily waterings needed: ");
+    	scanf("%d", &g_tm[i].need);
+    }
+ 
+    g_tm[i].p = rand() % 3;
+ 
+    g_tm[i].cnt = 0;
+    g_tm[i].last_time_h = -1;
+    g_tm[i].last_time_m = -1;
+    total_required += g_tm[i].need;
+    if (g_tm[i].need > mx) mx = g_tm[i].need;
+  }
+ 
+  printf("\nEnter daily water limit (sessions): ");
+  scanf("%d", &water_limit);
+ 
+  printf("\n=== SUMMARY ===\n");
+  printf("Total required: %d waterings\n", total_required);
+  printf("Water limit:    %d waterings\n", water_limit);
+ 
+  if (total_required > water_limit) {
+    printf("WARNING: Water limit (%d) < Required (%d)\n", water_limit, total_required);
+    printf("   Some sections may not get full water!\n");
+  } else if (water_limit >= total_required + 2) {
+    printf("SUFFICIENT: Extra water available\n");
+  } else {
+    printf("TIGHT: Just enough water\n");
+  }
+ 
+  for (int i = 0; i < n; i++) {
+    sem_init(&g_tm[i].semaphore, 0, 0);
+    pthread_mutex_init(&g_tm[i].mutex, NULL);
+    g_tm[i].soil_check = false;
+  }
+ 
+  for (int i = 0; i < n; i++) {
+    pthread_create(&g_tm[i].thread, NULL, item_thread, &g_tm[i]);
+  }
+ 
+  pthread_t t_thread;
+  pthread_create(&t_thread, NULL, time_thread, g_tm);
+ 
+  printf("\n=== Starting simulation ===\n");
+  pthread_join(t_thread, NULL);
+ 
+  for (int i = 0; i < n; i++) {
+    pthread_join(g_tm[i].thread, NULL);
+  }
+ 
+  status(g_tm);
+  for (int i = 0; i < n; i++) {
+    sem_destroy(&g_tm[i].semaphore);
+    pthread_mutex_destroy(&g_tm[i].mutex);
+  }
+ 
+  pthread_mutex_destroy(&water_supply_mutex);
+  pthread_mutex_destroy(&schedule_mutex);
+  pthread_mutex_destroy(&water_limit_mutex);
+ 
+  free(g_tm);
+  printf("\n=== Simulation complete ===\n");
+}
+ 
+void dash_board() {
+  printf("\033[32m");
+  printf("█▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀█\n");
+  printf("█░░ ╦ ╦ ╔╗ ╦  ╔╗ ╔╗ ╔╦╗ ╔╗ ░░█\n");
+  printf("█░░ ║║║ ╠  ║  ║  ║║ ║║║ ╠  ░░█\n");
+  printf("█░░ ╚╩╝ ╚╝ ╚╝ ╚╝ ╚╝ ╩ ╩ ╚╝ ░░█\n");
+  printf("█▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄█\n");
+ 
+  bool x = true;
+  while (x) {
+    int y;
+    bool z = false;
+    printf("\n1. Start Garden Simulation\n");
+    printf("2. Exit\n");
+    printf("Choose an option: ");
+    scanf("%d", &y);
+ 
+    switch(y) {
+      case 1:
+      	z = true;
+      	initialization();
+      	break;
+      case 2:
+      	x = false;
+      	printf("Exiting program...\n");
+      	break;
+      default:
+      	printf("Invalid input! Please choose 1 or 2.\n");
+    }
+    if (z) {
+    	printf("Exiting program...\n");
+    	break;
+    }
+    printf("\033[0m");
+  }
+}
+ 
+int main() {
+  dash_board();
+  return 0;
+}
